@@ -184,8 +184,24 @@ st.markdown("Upload your Google Ads export to uncover the *psychology* behind yo
 uploaded_file = st.file_uploader("Upload CSV (Ads & Assets Report)", type=['csv'])
 
 if uploaded_file is not None:
-    # 1. Load Data
-    raw_df = pd.read_csv(uploaded_file)
+    # 1. Load Data (Robust Method)
+    try:
+        # Google Ads CSVs often have 2 lines of metadata at top. Try skipping them.
+        raw_df = pd.read_csv(uploaded_file, skiprows=2)
+        
+        # Check if 'Asset' column exists. If not, maybe the user deleted the top rows already.
+        # So we try reading normally without skipping.
+        if 'Asset' not in raw_df.columns:
+            uploaded_file.seek(0) # Reset file pointer
+            raw_df = pd.read_csv(uploaded_file)
+            
+    except pd.errors.ParserError:
+        # If standard parsing fails, try a different engine (useful for some encodings)
+        uploaded_file.seek(0)
+        raw_df = pd.read_csv(uploaded_file, skiprows=2, engine='python')
+    except Exception as e:
+        st.error(f"Error reading CSV: {e}")
+        st.stop()
     
     # 2. Process Data
     with st.spinner("Cleaning data and aggregating duplicate assets..."):
@@ -216,4 +232,5 @@ if uploaded_file is not None:
                     except Exception as e:
                         st.error(f"AI Error: {e}")
     else:
+
         st.warning("No valid text assets found. Ensure your CSV has 'Asset', 'Impressions', and 'Cost' columns.")
