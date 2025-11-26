@@ -30,22 +30,37 @@ with st.sidebar:
     st.warning("⚠️ **Requirement:** Your CSV must contain **'Impressions'** and **'Cost'**. If missing, the tool cannot calculate performance.")
 
 # ==========================================
-# 2. DATA PROCESSING ENGINE
+# 2. ROBUST FILE LOADER (The Fix)
 # ==========================================
 def find_header_row(uploaded_file):
     """
-    Scans the file to find the header row by looking for key ad columns.
+    Reads the file line-by-line (as raw text) to find the header.
+    This prevents Pandas from crashing on column count mismatches.
     """
     uploaded_file.seek(0)
-    preview = pd.read_csv(uploaded_file, header=None, nrows=20, on_bad_lines='skip')
     
-    for idx, row in preview.iterrows():
-        row_str = " ".join(row.astype(str)).lower()
-        # Check for signatures of Ad Reports or Asset Reports
-        if ('ad state' in row_str and 'headline' in row_str) or \
-           ('asset' in row_str and 'status' in row_str) or \
-           ('headline 1' in row_str):
-            return idx
+    current_pos = 0
+    for i in range(20): # Scan first 20 lines
+        line_bytes = uploaded_file.readline()
+        
+        # Decode bytes to string
+        try:
+            line_str = line_bytes.decode('utf-8').lower()
+        except:
+            try:
+                line_str = line_bytes.decode('latin-1').lower() # Fallback encoding
+            except:
+                continue # Skip unreadable lines
+        
+        # Check for header signatures
+        if 'ad state' in line_str and 'headline' in line_str:
+            uploaded_file.seek(0)
+            return i
+        if 'asset' in line_str and 'status' in line_str:
+            uploaded_file.seek(0)
+            return i
+            
+    uploaded_file.seek(0)
     return 0
 
 def clean_metric(val):
@@ -80,13 +95,19 @@ def process_rsa_file(df):
     df = df.rename(columns=col_map)
     
     # 2. Handle Missing Metrics (Graceful Fallback)
-    # If Cost is missing (common in some reports), we warn but don't crash.
     if 'Cost' not in df.columns:
-        st.warning("⚠️ 'Cost' column missing. We will use 'Clicks' for volume analysis.")
-        df['Cost'] = 0.0
+        if 'Clicks' in df.columns and 'CPC' in df.columns:
+            df['Cost'] = df['Clicks'] * df['CPC'] # Infer cost
+        else:
+            df['Cost'] = 0.0
+            
     if 'Impressions' not in df.columns:
-        st.warning("⚠️ 'Impressions' column missing. We will use 'Clicks' to estimate traffic.")
-        df['Impressions'] = df['Clicks'] if 'Clicks' in df.columns else 0.0
+        if 'Clicks' in df.columns and 'CTR' in df.columns:
+             # Reverse engineer impressions: Clicks / (CTR/100)
+             # Avoid div by zero
+             df['Impressions'] = df.apply(lambda x: x['Clicks'] / (x['CTR']/100) if x['CTR'] > 0 else 0, axis=1)
+        else:
+             df['Impressions'] = df['Clicks'] if 'Clicks' in df.columns else 0.0
 
     # Clean Metrics
     for m in ['Cost', 'Impressions', 'CTR', 'Conversions', 'Conv_Value', 'Clicks']:
@@ -96,25 +117,21 @@ def process_rsa_file(df):
             df[m] = 0.0
 
     # 3. MELT (The Magic Step)
-    # Grab all Headline/Description columns (Headline 1...15)
     text_cols = [c for c in df.columns if ('headline' in c or 'description' in c) and 'position' not in c and 'image' not in c]
     
-    # Metrics we want to keep associated with the text
     id_vars = ['Cost', 'Impressions', 'Conversions', 'Conv_Value', 'Clicks']
     id_vars = [c for c in id_vars if c in df.columns]
     
-    # Transform from Wide to Long
     melted = df.melt(id_vars=id_vars, value_vars=text_cols, value_name='Cleaned_Text')
     
     # 4. Clean Text
     melted['Cleaned_Text'] = melted['Cleaned_Text'].astype(str).str.strip('"').str.strip()
     melted = melted[melted['Cleaned_Text'].str.len() > 2] # Remove empty
-    melted = melted[~melted['Cleaned_Text'].str.contains('--', na=False)] # Remove placeholders
+    melted = melted[~melted['Cleaned_Text'].str.contains('--', na=False)] 
     
     return melted
 
 def aggregate_data(df):
-    # Group by the Text to see global performance
     grouped = df.groupby('Cleaned_Text').agg({
         'Impressions': 'sum',
         'Cost': 'sum',
@@ -123,11 +140,8 @@ def aggregate_data(df):
         'Clicks': 'sum'
     }).reset_index()
     
-    # Recalculate KPIs
     grouped['ROAS'] = np.where(grouped['Cost']>0, grouped['Conv_Value']/grouped['Cost'], 0)
     grouped['CPA'] = np.where(grouped['Conversions']>0, grouped['Cost']/grouped['Conversions'], 0)
-    
-    # If Impressions are missing/zero, use Clicks to avoid division by zero
     grouped['CTR'] = np.where(grouped['Impressions']>0, (grouped['Clicks']/grouped['Impressions'])*100, 0)
     
     return grouped
@@ -138,22 +152,20 @@ def aggregate_data(df):
 def run_ai_analysis(df, key):
     client = openai.OpenAI(api_key=key)
     
-    # Prepare Data Snippets
     top_ads = df.sort_values(by='ROAS', ascending=False).head(10).to_dict(orient='records')
     click_magnets = df.sort_values(by='Clicks', ascending=False).head(10).to_dict(orient='records')
     
     system_prompt = """
     You are AdRank AI, a Behavioral Science Marketing Strategist.
     
-    ### THE CODEBOOK (Use these tags)
+    ### THE CODEBOOK
     1. **Psychology:** Scarcity, Social Proof, Authority, Reciprocity, Loss Aversion.
     2. **Tone:** Urgent, Corporate, Playful, Empathetic, Direct.
-    3. **Structure:** Question, List, "How-to".
 
     ### OUTPUT FORMAT
     1. **EXECUTIVE DIAGNOSIS:** One bold sentence on the account's biggest opportunity.
     2. **🏆 THE WINNING FORMULA:** Analyze 'Top Performers'. What specific tone/words correlate with high ROAS?
-    3. **🚩 THE CLICKBAIT TRAP:** Analyze 'Click Magnets'. Why do these get traffic but maybe less efficiency?
+    3. **🚩 THE CLICKBAIT TRAP:** Analyze 'Click Magnets'. Why do these get traffic but less efficiency?
     4. **🚀 3 HYPOTHESIS TESTS:** Write 3 NEW headlines to test based on the Winning Formula.
     """
 
@@ -179,16 +191,21 @@ def run_ai_analysis(df, key):
 # 4. MAIN APP FLOW
 # ==========================================
 st.title("🧠 AdRank AI: RSA & Asset Analyzer")
-st.write("Upload your Google Ads **Ad Report** (Headline 1...15) or **Asset Report**.")
+st.write("Upload your Google Ads **Ad Report** or **Asset Report**.")
 
 uploaded_file = st.file_uploader("Upload CSV", type=['csv'])
 
 if uploaded_file is not None:
-    # 1. Smart Load
+    # 1. ROBUST LOAD
     header_idx = find_header_row(uploaded_file)
-    uploaded_file.seek(0)
-    raw_df = pd.read_csv(uploaded_file, skiprows=header_idx)
     
+    # Use python engine which is slower but much more robust to "Expected 1 fields saw 171" errors
+    try:
+        raw_df = pd.read_csv(uploaded_file, skiprows=header_idx, engine='python')
+    except Exception as e:
+        st.error(f"Failed to read CSV. Try opening it in Excel and saving as a fresh CSV. Error: {e}")
+        st.stop()
+
     # 2. Detect & Transform
     with st.spinner("Processing file structure..."):
         try:
@@ -200,7 +217,6 @@ if uploaded_file is not None:
                 # Show Dashboard
                 st.success("✅ File Processed Successfully!")
                 
-                # Metrics
                 c1, c2, c3 = st.columns(3)
                 c1.metric("Unique Copy Assets", len(final_df))
                 c2.metric("Total Spend", f"${final_df['Cost'].sum():,.0f}")
@@ -209,13 +225,12 @@ if uploaded_file is not None:
                 with st.expander("🔎 View Top Performing Copy"):
                     st.dataframe(final_df.sort_values(by='Cost', ascending=False).head(10))
                 
-                # AI Section
                 st.markdown("### 🤖 Behavioral Analysis")
                 if st.button("Generate Insights"):
                     if not api_key:
-                        st.error("Please enter OpenAI API Key in the sidebar.")
+                        st.error("Please enter OpenAI API Key.")
                     else:
-                        with st.spinner("Analyzing semantic patterns & psychology..."):
+                        with st.spinner("Analyzing semantic patterns..."):
                             try:
                                 insights = run_ai_analysis(final_df, api_key)
                                 st.success("Analysis Complete!")
